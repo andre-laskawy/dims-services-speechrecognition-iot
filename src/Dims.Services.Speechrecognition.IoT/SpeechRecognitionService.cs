@@ -12,6 +12,7 @@ namespace Dims.Services.Speechrecognition.IoT
     using Nanomite;
     using Nanomite.Core.Network;
     using Nanomite.Core.Network.Common;
+    using Nanomite.Core.Network.Common.Models;
     using System;
     using System.Collections.Generic;
     using System.Diagnostics;
@@ -46,6 +47,12 @@ namespace Dims.Services.Speechrecognition.IoT
         private static DateTime lastListenCylce = DateTime.MinValue;
 
         /// <summary>
+        /// The current log level.
+        /// </summary>
+        public static int LoggingLevel { get; set; }
+
+        /// <summary>
+        /// Gets or sets the Hotword
         /// The hotword
         /// </summary>
         public static string Hotword { get; set; }
@@ -53,13 +60,18 @@ namespace Dims.Services.Speechrecognition.IoT
         /// <summary>
         /// Initializes a new instance of the <see cref="SpeechRecognitionService"/> class.
         /// </summary>
+        /// <param name="brokerAddress">The brokerAddress<see cref="string"/></param>
+        /// <param name="user">The user<see cref="string"/></param>
+        /// <param name="pass">The pass<see cref="string"/></param>
+        /// <param name="secret">The secret<see cref="string"/></param>
         /// <param name="hotword">The hotword.</param>
-        public static void Run(string brokerAddress, string user, string pass, string secret, string hotword)
+        public static async void Run(string brokerAddress, string user, string pass, string secret, string hotword)
         {
+            LoggingLevel = (int)LogLevel.Info;
             Hotword = hotword;
 
             /// Init connection to broker
-            InitBrokerConnection(brokerAddress, user, pass, secret);
+            await InitBrokerConnection(brokerAddress, user, pass, secret);
 
             // Reinit speechrecognition to ensure it is running forever
             serviceGuard = new Timer(Run, null, 1000, 1000 * 60);
@@ -68,17 +80,33 @@ namespace Dims.Services.Speechrecognition.IoT
         /// <summary>
         /// Initializes the connection.
         /// </summary>
-        /// <param name="config">The configuration.</param>
-        /// <returns></returns>
-        private static async void InitBrokerConnection(string brokerAddress, string user, string pass, string secret)
+        /// <param name="brokerAddress">The brokerAddress<see cref="string"/></param>
+        /// <param name="user">The user<see cref="string"/></param>
+        /// <param name="pass">The pass<see cref="string"/></param>
+        /// <param name="secret">The secret<see cref="string"/></param>
+        private static async Task InitBrokerConnection(string brokerAddress, string user, string pass, string secret)
         {
             try
             {
                 client = NanomiteClient.CreateGrpcClient(brokerAddress, user);
-                client.OnConnected = () => { Debug.WriteLine("Connected"); };
+                client.OnConnected = async () =>
+                {
+                    var subscriptionMessage = new SubscriptionMessage() { Topic = "SetLogLevel" };
+                    await client.SendCommandAsync(subscriptionMessage, StaticCommandKeys.Subscribe);
+                };
+                client.OnCommandReceived = (cmd, c) =>
+                {
+                    switch (cmd.Topic)
+                    {
+                        case "SetLogLevel":
+                            var level = cmd.Data[0].CastToModel<LogLevelInfo>()?.Level;
+                            LoggingLevel = (int)(LogLevel)System.Enum.Parse(typeof(LogLevel), level);
+                            break;
+                    }
+                };
                 await client.ConnectAsync(user, pass, secret, true);
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 throw ex;
             }
@@ -87,6 +115,7 @@ namespace Dims.Services.Speechrecognition.IoT
         /// <summary>
         /// Runs the service.
         /// </summary>
+        /// <param name="state">The state<see cref="object"/></param>
         private static async void Run(object state)
         {
             try
@@ -103,7 +132,7 @@ namespace Dims.Services.Speechrecognition.IoT
                     {
                         await recognizer.StopRecognitionAsync();
                     }
-                    catch(Exception ex)
+                    catch (Exception ex)
                     {
                         Log(ex);
                     }
@@ -167,7 +196,7 @@ namespace Dims.Services.Speechrecognition.IoT
         /// <param name="args">The <see cref="Windows.Media.SpeechRecognition.SpeechContinuousRecognitionResultGeneratedEventArgs" /> instance containing the event data.</param>
         private static void RecognizerResultGenerated(SpeechContinuousRecognitionSession session, SpeechContinuousRecognitionResultGeneratedEventArgs args)
         {
-            if (!string.IsNullOrEmpty(args.Result.Text)) 
+            if (!string.IsNullOrEmpty(args.Result.Text))
             {
                 if (args.Result.Confidence == SpeechRecognitionConfidence.High
                     || args.Result.Confidence == SpeechRecognitionConfidence.Medium)
@@ -227,33 +256,48 @@ namespace Dims.Services.Speechrecognition.IoT
             await client.SendCommandAsync(cmd);
         }
 
+        /// <summary>
+        /// Logs a message to the server
+        /// </summary>
+        /// <param name="level">The level<see cref="LoggingLevel"/></param>
+        /// <param name="message">The message<see cref="string"/></param>
         private static async void Log(LogLevel level, string message)
         {
             Debug.WriteLine(message);
-            var cmd = new Command() { Type = CommandType.Action, Topic = level.ToString() };
-            LogMessage logMessage = new LogMessage()
+            if ((int)level >= LoggingLevel)
             {
-                Level = level.ToString(),
-                Message = message
-            };
-            cmd.Data.Add(Any.Pack(logMessage));
+                var cmd = new Command() { Type = CommandType.Action, Topic = level.ToString() };
+                LogMessage logMessage = new LogMessage()
+                {
+                    Level = level.ToString(),
+                    Message = message
+                };
+                cmd.Data.Add(Any.Pack(logMessage));
 
-            await client.SendCommandAsync(cmd);
+                await client.SendCommandAsync(cmd);
+            }
         }
-        
+
+        /// <summary>
+        /// Logs an error to the server
+        /// </summary>
+        /// <param name="ex">The ex<see cref="Exception"/></param>
         private static async void Log(Exception ex)
         {
             Debug.WriteLine(ex);
-            var cmd = new Command() { Type = CommandType.Action, Topic = LogLevel.Error.ToString() };
-            LogMessage logMessage = new LogMessage()
+            if ((int)LogLevel.Error >= LoggingLevel)
             {
-                Level = LogLevel.Error.ToString(),
-                Message = ex.ToText(),
-                StackTrace = ex.StackTrace
-            };
-            cmd.Data.Add(Any.Pack(logMessage));
+                var cmd = new Command() { Type = CommandType.Action, Topic = LogLevel.Error.ToString() };
+                LogMessage logMessage = new LogMessage()
+                {
+                    Level = LogLevel.Error.ToString(),
+                    Message = ex.ToText(),
+                    StackTrace = ex.StackTrace
+                };
+                cmd.Data.Add(Any.Pack(logMessage));
 
-            await client.SendCommandAsync(cmd);
+                await client.SendCommandAsync(cmd);
+            }
         }
     }
 }

@@ -6,6 +6,10 @@
 
 namespace Dims.Services.Speechrecognition.IoT
 {
+    using Dims.Common.Models;
+    using Google.Protobuf.WellKnownTypes;
+    using Grpc.Core.Logging;
+    using Nanomite;
     using Nanomite.Core.Network;
     using Nanomite.Core.Network.Common;
     using System;
@@ -37,9 +41,9 @@ namespace Dims.Services.Speechrecognition.IoT
         private static Timer serviceGuard;
 
         /// <summary>
-        /// The is processing input flag
+        /// The last listing cycle.
         /// </summary>
-        private static bool IsProcessingInput;
+        private static DateTime lastListenCylce = DateTime.MinValue;
 
         /// <summary>
         /// The hotword
@@ -72,11 +76,11 @@ namespace Dims.Services.Speechrecognition.IoT
             {
                 client = NanomiteClient.CreateGrpcClient(brokerAddress, user);
                 client.OnConnected = () => { Debug.WriteLine("Connected"); };
-                await client.ConnectAsync(user, pass, secret);
+                await client.ConnectAsync(user, pass, secret, true);
             }
             catch(Exception ex)
             {
-                Debug.WriteLine(ex);
+                throw ex;
             }
         }
 
@@ -87,18 +91,27 @@ namespace Dims.Services.Speechrecognition.IoT
         {
             try
             {
-                if (IsProcessingInput)
+                // restart listener if nothing has happend for more than 30 seconds
+                if (lastListenCylce > DateTime.Now.AddSeconds(-30))
                 {
                     return;
                 }
 
                 if (recognizer != null)
                 {
-                    await recognizer.ContinuousRecognitionSession.StopAsync();
-                    recognizer.Dispose();
+                    try
+                    {
+                        await recognizer.StopRecognitionAsync();
+                    }
+                    catch(Exception ex)
+                    {
+                        Log(ex);
+                    }
                 }
 
                 recognizer = new SpeechRecognizer(new Language("de-DE"));
+                recognizer.Timeouts.InitialSilenceTimeout = TimeSpan.FromSeconds(2);
+                recognizer.Timeouts.EndSilenceTimeout = TimeSpan.FromSeconds(0.5);
                 recognizer.StateChanged += RecognizerStateChanged;
                 recognizer.ContinuousRecognitionSession.ResultGenerated += RecognizerResultGenerated;
 
@@ -110,17 +123,17 @@ namespace Dims.Services.Speechrecognition.IoT
 
                 if (compilationResult.Status == SpeechRecognitionResultStatus.Success)
                 {
-                    Debug.WriteLine("Result: " + compilationResult.ToString());
+                    Log(LogLevel.Debug, "Speechrecognition compile result: " + compilationResult.ToString());
                     await Listen();
                 }
                 else
                 {
-                    Debug.WriteLine("Status: " + compilationResult.Status);
+                    Log(LogLevel.Debug, "Speechrecognition compile result: " + compilationResult.ToString());
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine(ex);
+                Log(ex);
             }
         }
 
@@ -139,11 +152,11 @@ namespace Dims.Services.Speechrecognition.IoT
             }
             catch (System.Runtime.InteropServices.COMException e) when (e.HResult == unchecked((int)0x80045509))
             {
-                Debug.WriteLine("Policy error");
+                Log(LogLevel.Warning, "Policy error");
             }
             catch (Exception ex)
             {
-                Debug.WriteLine(ex);
+                Log(ex);
             }
         }
 
@@ -159,9 +172,7 @@ namespace Dims.Services.Speechrecognition.IoT
                 if (args.Result.Confidence == SpeechRecognitionConfidence.High
                     || args.Result.Confidence == SpeechRecognitionConfidence.Medium)
                 {
-                    IsProcessingInput = true;
-                    Debug.WriteLine("User input: " + args.Result.Text);
-
+                    Log(LogLevel.Debug, "User input recognized: " + args.Result.Text);
                     try
                     {
                         if (client != null)
@@ -185,11 +196,7 @@ namespace Dims.Services.Speechrecognition.IoT
                     }
                     catch (Exception ex)
                     {
-                        Debug.WriteLine(ex);
-                    }
-                    finally
-                    {
-                        IsProcessingInput = false;
+                        Log(ex);
                     }
                 }
             }
@@ -202,9 +209,10 @@ namespace Dims.Services.Speechrecognition.IoT
         /// <param name="args">The <see cref="Windows.Media.SpeechRecognition.SpeechRecognizerStateChangedEventArgs" /> instance containing the event data.</param>
         private static async void RecognizerStateChanged(Windows.Media.SpeechRecognition.SpeechRecognizer sender, SpeechRecognizerStateChangedEventArgs args)
         {
-            Debug.WriteLine("Speech recognizer state: " + args.State);
-            if (args.State == SpeechRecognizerState.Idle && !IsProcessingInput)
+            Log(LogLevel.Debug, "Speech recognizer state: " + args.State);
+            if (args.State == SpeechRecognizerState.Idle)
             {
+                lastListenCylce = DateTime.Now;
                 await Listen();
             }
         }
@@ -216,6 +224,35 @@ namespace Dims.Services.Speechrecognition.IoT
         private static async void Publish(string topic)
         {
             var cmd = new Command() { Type = CommandType.Action, Topic = topic };
+            await client.SendCommandAsync(cmd);
+        }
+
+        private static async void Log(LogLevel level, string message)
+        {
+            Debug.WriteLine(message);
+            var cmd = new Command() { Type = CommandType.Action, Topic = level.ToString() };
+            LogMessage logMessage = new LogMessage()
+            {
+                Level = level.ToString(),
+                Message = message
+            };
+            cmd.Data.Add(Any.Pack(logMessage));
+
+            await client.SendCommandAsync(cmd);
+        }
+        
+        private static async void Log(Exception ex)
+        {
+            Debug.WriteLine(ex);
+            var cmd = new Command() { Type = CommandType.Action, Topic = LogLevel.Error.ToString() };
+            LogMessage logMessage = new LogMessage()
+            {
+                Level = LogLevel.Error.ToString(),
+                Message = ex.ToText(),
+                StackTrace = ex.StackTrace
+            };
+            cmd.Data.Add(Any.Pack(logMessage));
+
             await client.SendCommandAsync(cmd);
         }
     }
